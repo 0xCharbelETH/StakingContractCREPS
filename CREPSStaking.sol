@@ -1,175 +1,183 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+// SPDX-License-Identifier: MIT pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol"; import "@openzeppelin/contracts/access/Ownable.sol"; import "@openzeppelin/contracts/security/ReentrancyGuard.sol"; import "@openzeppelin/contracts/security/Pausable.sol";
 
-contract CREPSStaking is Ownable, ReentrancyGuard {
-    IERC20 public crepsToken; // Contrat du token $CREPS
-    address public rewardWallet; // Portefeuille de récompenses
-    uint256 public apy; // APY en pourcentage (ex. 200 pour 200%)
-    uint256 public lockPeriod; // Période de verrouillage en secondes
+contract CREPSStaking is Ownable, ReentrancyGuard, Pausable { IERC20 public crepsToken; address public rewardWallet;
 
-    // Structure pour stocker les informations de jalonnement par utilisateur
-    struct StakeInfo {
-        uint256 amount; // Montant jalonné
-        uint256 startTime; // Heure de début du jalonnement
-        uint256 lastClaimTime; // Dernière fois que les récompenses ont été réclamées
-    }
+uint256 public apy; // e.g., 20000 = 200.00%
+uint256 public lockPeriod;
+uint256 public constant APY_DIVISOR = 20000;
+uint256 public maxAPY = 20000; // 200%
+uint256 public maxStakePerUser = 1_000_000 * 10**18; // Exemple : 1 million CREPS
 
-    mapping(address => StakeInfo) public stakes; // Informations de jalonnement par utilisateur
-    mapping(address => uint256) public pendingRewards; // Récompenses en attente
+struct StakeInfo {
+    uint256 amount;
+    uint256 startTime;
+    uint256 lastClaimTime;
+}
 
-    // Événements pour le suivi des actions
-    event Staked(address indexed user, uint256 amount, uint256 timestamp);
-    event Unstaked(address indexed user, uint256 amount, uint256 timestamp);
-    event RewardsClaimed(address indexed user, uint256 amount, uint256 timestamp);
-    event RewardWalletUpdated(address newWallet);
-    event APYUpdated(uint256 newAPY);
-    event LockPeriodUpdated(uint256 newLockPeriod);
-    event EmergencyWithdraw(uint256 amount);
+mapping(address => StakeInfo) public stakes;
+mapping(address => uint256) public pendingRewards;
+address[] public stakers;
+mapping(address => bool) private hasStaked;
 
-    // Constructeur
-    constructor(
-        address _crepsToken,
-        address _rewardWallet,
-        uint256 _initialAPY,
-        uint256 _initialLockPeriod
-    ) {
-        crepsToken = IERC20(_crepsToken);
-        rewardWallet = _rewardWallet;
-        apy = _initialAPY;
-        lockPeriod = _initialLockPeriod;
-    }
+event Staked(address indexed user, uint256 amount, uint256 timestamp);
+event Unstaked(address indexed user, uint256 amount, uint256 timestamp);
+event RewardsClaimed(address indexed user, uint256 amount, uint256 timestamp);
+event RewardWalletUpdated(address newWallet);
+event APYUpdated(uint256 newAPY);
+event LockPeriodUpdated(uint256 newLockPeriod);
+event EmergencyWithdraw(uint256 amount);
+event Paused(address);
+event Unpaused(address);
 
-    // Fonction pour jalonner des tokens $CREPS
-    function stake(uint256 amount) external nonReentrant {
-        require(amount > 0, "Montant doit etre superieur a 0");
+constructor(
+    address _crepsToken,
+    address _rewardWallet,
+    uint256 _initialAPY,
+    uint256 _initialLockPeriod
+) {
+    require(_initialAPY <= maxAPY, "APY trop eleve");
+    crepsToken = IERC20(_crepsToken);
+    rewardWallet = _rewardWallet;
+    apy = _initialAPY;
+    lockPeriod = _initialLockPeriod;
+}
 
-        StakeInfo storage userStake = stakes[msg.sender];
+modifier onlyStaker() {
+    require(stakes[msg.sender].amount > 0, "Aucun token jalonne");
+    _;
+}
 
-        // Si l'utilisateur a déjà jalonné, mettre à jour les récompenses avant d'ajouter
-        if (userStake.amount > 0) {
-            pendingRewards[msg.sender] += calculateReward(msg.sender);
-            userStake.lastClaimTime = block.timestamp;
-        } else {
-            userStake.startTime = block.timestamp;
-            userStake.lastClaimTime = block.timestamp;
+function stake(uint256 amount) external nonReentrant whenNotPaused {
+    require(amount > 0, "Montant doit etre superieur a 0");
+    StakeInfo storage userStake = stakes[msg.sender];
+    require(userStake.amount + amount <= maxStakePerUser, "Dépassement du stake maximal");
+
+    if (userStake.amount > 0) {
+        pendingRewards[msg.sender] += calculateReward(msg.sender);
+        userStake.lastClaimTime = block.timestamp;
+    } else {
+        userStake.startTime = block.timestamp;
+        userStake.lastClaimTime = block.timestamp;
+        if (!hasStaked[msg.sender]) {
+            hasStaked[msg.sender] = true;
+            stakers.push(msg.sender);
         }
-
-        userStake.amount += amount;
-
-        // Transférer les tokens $CREPS de l'utilisateur vers le contrat
-        require(crepsToken.transferFrom(msg.sender, address(this), amount), "Transfert echoue");
-
-        emit Staked(msg.sender, amount, block.timestamp);
     }
 
-    // Fonction pour dé-staker (unstake) après la période de verrouillage
-    function unstake() external nonReentrant {
-        StakeInfo storage userStake = stakes[msg.sender];
-        require(userStake.amount > 0, "Aucun token jalonne");
-        require(block.timestamp >= userStake.startTime + lockPeriod, "Periode de verrouillage non ecoulee");
+    userStake.amount += amount;
+    require(crepsToken.transferFrom(msg.sender, address(this), amount), "Transfert echoue");
 
-        uint256 amount = userStake.amount;
-        userStake.amount = 0;
-        userStake.startTime = 0;
-        userStake.lastClaimTime = 0;
+    emit Staked(msg.sender, amount, block.timestamp);
+}
 
-        // Transférer les tokens jalonnés à l'utilisateur
-        require(crepsToken.transfer(msg.sender, amount), "Echec du retour des tokens");
+function unstake() external nonReentrant onlyStaker whenNotPaused {
+    StakeInfo storage userStake = stakes[msg.sender];
+    require(block.timestamp >= userStake.startTime + lockPeriod, "Periode de verrouillage non ecoulee");
 
-        // Ajouter les récompenses en attente
-        uint256 reward = pendingRewards[msg.sender] + calculateReward(msg.sender);
-        if (reward > 0) {
-            pendingRewards[msg.sender] = 0;
-            require(crepsToken.transferFrom(rewardWallet, msg.sender, reward), "Echec de la recompense");
-            emit RewardsClaimed(msg.sender, reward, block.timestamp);
-        }
+    uint256 amount = userStake.amount;
+    uint256 reward = pendingRewards[msg.sender] + calculateReward(msg.sender);
 
-        emit Unstaked(msg.sender, amount, block.timestamp);
-    }
+    userStake.amount = 0;
+    userStake.startTime = 0;
+    userStake.lastClaimTime = 0;
+    pendingRewards[msg.sender] = 0;
 
-    // Fonction pour réclamer les récompenses sans dé-staker
-    function claimRewards() external nonReentrant {
-        require(stakes[msg.sender].amount > 0, "Aucun token jalonne");
+    require(crepsToken.transfer(msg.sender, amount), "Echec du retour des tokens");
 
-        uint256 reward = pendingRewards[msg.sender] + calculateReward(msg.sender);
-        require(reward > 0, "Aucune recompense a reclamer");
-
-        // Mettre à jour les récompenses en attente
-        pendingRewards[msg.sender] = 0;
-        stakes[msg.sender].lastClaimTime = block.timestamp;
-
-        // Transférer les récompenses depuis le rewardWallet
+    if (reward > 0) {
+        require(crepsToken.balanceOf(rewardWallet) >= reward, "RewardWallet insuffisant");
         require(crepsToken.transferFrom(rewardWallet, msg.sender, reward), "Echec de la recompense");
-
         emit RewardsClaimed(msg.sender, reward, block.timestamp);
     }
 
-    // Calculer les récompenses pour un utilisateur
-    function calculateReward(address user) public view returns (uint256) {
-        StakeInfo memory userStake = stakes[user];
-        if (userStake.amount == 0) return 0;
+    emit Unstaked(msg.sender, amount, block.timestamp);
+}
 
-        uint256 timeSinceLastClaim = block.timestamp - userStake.lastClaimTime;
-        if (timeSinceLastClaim == 0) return 0;
+function claimRewards() external nonReentrant onlyStaker whenNotPaused {
+    uint256 reward = pendingRewards[msg.sender] + calculateReward(msg.sender);
+    require(reward > 0, "Aucune recompense a reclamer");
+    require(crepsToken.balanceOf(rewardWallet) >= reward, "RewardWallet insuffisant");
 
-        // Récompense annuelle = montant jalonné * APY / 100
-        uint256 annualReward = (userStake.amount * apy) / 100;
-        // Récompense proportionnelle au temps écoulé
-        uint256 reward = (annualReward * timeSinceLastClaim) / (365 days);
-        return reward;
+    pendingRewards[msg.sender] = 0;
+    stakes[msg.sender].lastClaimTime = block.timestamp;
+
+    require(crepsToken.transferFrom(rewardWallet, msg.sender, reward), "Echec de la recompense");
+    emit RewardsClaimed(msg.sender, reward, block.timestamp);
+}
+
+function calculateReward(address user) public view returns (uint256) {
+    StakeInfo memory userStake = stakes[user];
+    if (userStake.amount == 0) return 0;
+
+    uint256 timeSinceLastClaim = block.timestamp - userStake.lastClaimTime;
+    if (timeSinceLastClaim == 0) return 0;
+
+    uint256 annualReward = (userStake.amount * apy) / APY_DIVISOR;
+    return (annualReward * timeSinceLastClaim) / 365 days;
+}
+
+function viewPendingRewards(address user) external view returns (uint256) {
+    return pendingRewards[user] + calculateReward(user);
+}
+
+function getStakeOf(address user) external view returns (uint256) {
+    return stakes[user].amount;
+}
+
+function getTotalStaked() external view returns (uint256 total) {
+    for (uint i = 0; i < stakers.length; i++) {
+        total += stakes[stakers[i]].amount;
     }
+}
 
-    // Fonction pour voir les récompenses en attente (inclut les nouvelles récompenses non encore accumulées)
-    function viewPendingRewards(address user) external view returns (uint256) {
-        return pendingRewards[user] + calculateReward(user);
+function checkRewardWalletBalance() external view returns (uint256) {
+    return crepsToken.balanceOf(rewardWallet);
+}
+
+function setRewardWallet(address _newRewardWallet) external onlyOwner {
+    require(_newRewardWallet != address(0), "Adresse invalide");
+    rewardWallet = _newRewardWallet;
+    emit RewardWalletUpdated(_newRewardWallet);
+}
+
+function setAPY(uint256 _newAPY) external onlyOwner {
+    require(_newAPY > 0 && _newAPY <= maxAPY, "APY invalide");
+    for (uint i = 0; i < stakers.length; i++) {
+        address staker = stakers[i];
+        pendingRewards[staker] += calculateReward(staker);
+        stakes[staker].lastClaimTime = block.timestamp;
     }
+    apy = _newAPY;
+    emit APYUpdated(_newAPY);
+}
 
-    // Fonction pour voir le solde du portefeuille de récompenses
-    function checkRewardWalletBalance() external view returns (uint256) {
-        return crepsToken.balanceOf(rewardWallet);
+function setLockPeriod(uint256 _newLockPeriod) external onlyOwner {
+    require(_newLockPeriod > 0, "Periode invalide");
+    lockPeriod = _newLockPeriod;
+    emit LockPeriodUpdated(_newLockPeriod);
+}
+
+function emergencyWithdraw(uint256 amount) external onlyOwner {
+    uint256 contractBalance = crepsToken.balanceOf(address(this));
+    uint256 totalStaked = 0;
+    for (uint i = 0; i < stakers.length; i++) {
+        totalStaked += stakes[stakers[i]].amount;
     }
+    require(contractBalance >= totalStaked + amount, "Fonds insuffisants");
+    require(crepsToken.transfer(owner(), amount), "Echec retrait urgence");
+    emit EmergencyWithdraw(amount);
+}
 
-    // Fonctions d'administration
+function pause() external onlyOwner {
+    _pause();
+    emit Paused(msg.sender);
+}
 
-    // Modifier l'adresse du portefeuille de récompenses
-    function setRewardWallet(address _newRewardWallet) external onlyOwner {
-        require(_newRewardWallet != address(0), "Adresse invalide");
-        rewardWallet = _newRewardWallet;
-        emit RewardWalletUpdated(_newRewardWallet);
-    }
+function unpause() external onlyOwner {
+    _unpause();
+    emit Unpaused(msg.sender);
+}
 
-    // Ajuster l'APY
-    function setAPY(uint256 _newAPY) external onlyOwner {
-        require(_newAPY > 0, "APY doit etre superieur a 0");
-        // Mettre à jour les récompenses en attente pour tous les utilisateurs avant de changer l'APY
-        // Note : Cette partie peut être optimisée en fonction du nombre d'utilisateurs
-        apy = _newAPY;
-        emit APYUpdated(_newAPY);
-    }
-
-    // Modifier la période de verrouillage
-    function setLockPeriod(uint256 _newLockPeriod) external onlyOwner {
-        require(_newLockPeriod > 0, "Periode de verrouillage invalide");
-        lockPeriod = _newLockPeriod;
-        emit LockPeriodUpdated(_newLockPeriod);
-    }
-
-    // Retrait d'urgence des tokens non mis en jeu (par le propriétaire uniquement)
-    function emergencyWithdraw(uint256 amount) external onlyOwner {
-        uint256 contractBalance = crepsToken.balanceOf(address(this));
-        uint256 totalStaked = 0;
-
-        // Calculer le total des tokens jalonnés (peut nécessiter une optimisation pour un grand nombre d'utilisateurs)
-        // Cette partie peut être ajustée en fonction de votre implémentation
-        // Pour simplifier ici, on suppose que les tokens jalonnés sont suivis via stakes
-
-        require(contractBalance >= totalStaked + amount, "Fonds insuffisants pour le retrait");
-        require(crepsToken.transfer(owner(), amount), "Echec du retrait d'urgence");
-
-        emit EmergencyWithdraw(amount);
-    }
 }
