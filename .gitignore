@@ -1,0 +1,21 @@
+# Node modules
+node_modules/
+
+# Build artifacts
+artifacts/
+cache/
+out/
+typechain/
+
+# Env vars
+.env
+
+# Coverage
+coverage/
+coverage.json
+lcov-report/
+
+# IDEs & system files
+.DS_Store
+.vscode/
+*.log
